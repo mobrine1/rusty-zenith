@@ -241,45 +241,6 @@ impl Server {
 	}
 }
 
-async fn source_stream(stream: &mut TcpStream, source_timeout: &u64, arc: &Arc<RwLock<Source>>, queue_size: usize, burst_size: usize)
-		  -> Result< (), Box< dyn Error > > {
-	// SOURCE http method
-
-	// Listen for bytes
-	while {
-		// Read the incoming stream data until it closes
-		let mut buf = [ 0; 1024 ];
-		let read = match timeout( Duration::from_millis( *source_timeout ), async {
-			match stream.read( &mut buf ).await {
-				Ok( n ) => n,
-				Err( e ) => {
-					println!( "An error occured while reading stream data: {}", e );
-					0
-				}
-			}
-		} ).await {
-			Ok( n ) => n,
-			Err( _ ) => {
-				println!( "A source timed out: {}", arc.read().await.mountpoint );
-				0
-			}
-		};
-
-		if read != 0 {
-			// Get the slice
-			let mut slice: Vec< u8 > = Vec::new();
-			slice.extend_from_slice( &buf[ .. read  ] );
-
-			broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-			arc.read().await.stats.write().await.bytes_read += read;
-		}
-
-		// Check if the source needs to be disconnected
-		read != 0 && !arc.read().await.disconnect_flag
-	}  {}
-	Ok( () )
-}
-
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
@@ -299,7 +260,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					return Err( e )
 				}
 			}
-
+			
 			match req.parse( &buf ) {
 				Ok( res ) => res.is_partial(),
 				Err( e ) => {
@@ -308,7 +269,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				}
 			}
 		} {}
-
+		
 		Ok( () )
 	} ).await {
 		Ok( Err( _ ) ) => return Ok( () ),
@@ -326,27 +287,27 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	let method = req.method.unwrap();
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
 	let path = path_clean::clean( base_path );
-
+	
 	let server_id = {
 		server.read().await.properties.server_id.clone()
 	};
-
+	
 	match method {
 		// Some info about the protocol is provided here: https://gist.github.com/ePirat/adc3b8ba00d85b7e3870
-		"SOURCE" | "PUT" => {
+		"SOURCE" => {
 			// Check for authorization
 			if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 				if !validate_user( &server.read().await.properties, name, pass ) {
 					// Invalid user/pass provided
-					send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
+					send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
 					return Ok( () )
 				}
 			} else {
 				// No auth, return and close
-				send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
+				send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
 				return Ok( () )
 			}
-
+			
 			// http://example.com/radio == http://example.com/radio/
 			// Not sure if this is done client-side prior to sending the request though
 			let path = {
@@ -359,61 +320,64 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					path
 				}
 			};
-
+			
 			// Check if the path contains 'admin' or 'api'
 			// TODO Allow for custom stream directory, such as http://example.com/stream/radio
 			if path == "/admin" ||
 					path.starts_with( "/admin/" ) ||
 					path == "/api" ||
 					path.starts_with( "/api/" ) {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
-
+			
 			// Check if it is valid
 			// For now this assumes the stream directory is /
 			let dir = Path::new( &path );
 			if let Some( parent ) = dir.parent() {
 				if let Some( parent_str ) = parent.to_str() {
 					if parent_str != "/" {
-						send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+						send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 						return Ok( () )
 					}
 				} else {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 					return Ok( () )
 				}
 			} else {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
-
+			
 			// Sources must have a content type
 			// Maybe the type that is served should be checked?
 			let mut properties = match get_header( "Content-Type", req.headers ) {
 				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
 				None => {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
 					return Ok( () )
 				}
 			};
-
+			
 			let mut serv = server.write().await;
 			// Check if the mountpoint is already in use
 			if serv.sources.contains_key( &path ) {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
-
+			
 			// Check if the max number of sources has been reached
 			if serv.sources.len() > serv.properties.limits.sources {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
 				return Ok( () )
 			}
-
+			
+			// Give an 200 OK response
+			send_ok( &mut stream, server_id, None ).await?;
+			
 			// Parse the headers for the source properties
 			populate_properties( &mut properties, req.headers );
-
+			
 			let source_stats = SourceStats {
 				start_time: {
 					if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
@@ -425,7 +389,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				bytes_read: 0,
 				peak_listeners: 0
 			};
-
+			
 			// Create the source
 			let source = Source {
 				mountpoint: path.clone(),
@@ -438,7 +402,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				fallback: None,
 				disconnect_flag: false
 			};
-
+			
 			let queue_size = serv.properties.limits.queue_size;
 			let ( burst_size, source_timeout ) =  {
 				if let Some( limit ) = serv.properties.limits.source_limits.get( &path ) {
@@ -447,55 +411,52 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					( serv.properties.limits.burst_size, serv.properties.limits.header_timeout )
 				}
 			};
-
+			
 			// Add to the server
 			let arc = Arc::new( RwLock::new( source ) );
 			serv.sources.insert( path, arc.clone() );
 			drop( serv );
-
+			
 			println!( "Mounted source on {}", arc.read().await.mountpoint );
-
+			
 			if buf.len() < body_offset {
 				let slice = &buf[ body_offset .. ];
 				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
 			}
-
-			if method == "SOURCE" {
-				// Give an 200 OK response
-				send_ok( &mut stream, &server_id, None ).await?;
-				source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
-			} else {
-				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
-				// Without it, it means that client has no body to send, we will stop if that's the case
-				match get_header( "Expect", req.headers ) {
-					Some(v) => {
-						match std::str::from_utf8(v) {
-							Ok(parsed) => {
-								if parsed == "100-continue" {
-									send_continue( &mut stream, &server_id ).await?;
-								} else {
-									// Some unknown value is passed
-									send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
-									return Ok( () )
-								}
-							},
-							Err(_) => {
-								// Some unknown unicode used. STOP
-								send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unknown unicode used in headers" ) ) ).await?;
-								return Ok( () )
-							}
+			
+			// Listen for bytes
+			while {
+				// Read the incoming stream data until it closes
+				let mut buf = [ 0; 1024 ];
+				let read = match timeout( Duration::from_millis( source_timeout ), async {
+					match stream.read( &mut buf ).await {
+						Ok( n ) => n,
+						Err( e ) => {
+							println!( "An error occured while reading stream data: {}", e );
+							0
 						}
-					},
-					None => {
-						send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
-						return Ok( () )
 					}
+				} ).await {
+					Ok( n ) => n,
+					Err( _ ) => {
+						println!( "A source timed out: {}", arc.read().await.mountpoint );
+						0
+					}
+				};
+				
+				if read != 0 {
+					// Get the slice
+					let mut slice: Vec< u8 > = Vec::new();
+					slice.extend_from_slice( &buf[ .. read  ] );
+					
+					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
+					arc.read().await.stats.write().await.bytes_read += read;
 				}
-				source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
-				// request must end with server 200 OK response
-				send_ok( &mut stream, &server_id, None ).await.ok();
-			}
-
+				
+				// Check if the source needs to be disconnected
+				read != 0 && !arc.read().await.disconnect_flag
+			}  {}
+			
 			let mut source = arc.write().await;
 			let fallback = source.fallback.clone();
 			if let Some( fallback_id ) = fallback {
@@ -529,6 +490,21 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 			println!( "Unmounted source {}", source.mountpoint );
 		}
+		"PUT" => {
+			// TODO Implement the PUT method
+			// I don't know any sources that use this method that I could easily get my hands on
+			// VLC only uses SOURCE
+			// For now, return a 405
+			stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
+			stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
+			stream.write_all( b"Connection: Close\r\n" ).await?;
+			stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
+			stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+			stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+			stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
+		}
 		"GET" => {
 			let source_id = path.to_owned();
 			let source_id = {
@@ -541,13 +517,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					source_id
 				}
 			};
-
+			
 			let mut serv = server.write().await;
 			let source_option = serv.sources.get( &source_id );
 			// Check if the source is valid
 			if let Some( source_lock ) = source_option {
 				let mut source = source_lock.write().await;
-
+				
 				// Check if the max number of listeners has been reached
 				let too_many_clients = {
 					if let Some( limit ) = serv.properties.limits.source_limits.get( &source_id ) {
@@ -557,16 +533,16 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					}
 				};
 				if serv.clients.len() >= serv.properties.limits.clients || too_many_clients {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many listeners connected" ) ) ).await?;
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Too many listeners connected" ) ) ).await?;
 					return Ok( () )
 				}
-
+				
 				// Check if metadata is enabled
 				let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
-
+				
 				// Reply with a 200 OK
-				send_listener_ok( &mut stream, &server_id, &source.properties, meta_enabled, serv.properties.metaint ).await?;
-
+				send_listener_ok( &mut stream, server_id, &source.properties, meta_enabled, serv.properties.metaint ).await?;
+				
 				// Create a client
 				// Get a valid UUID
 				let client_id = {
@@ -577,7 +553,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					}
 					unique
 				};
-
+	
 				let ( sender, receiver ) = unbounded_channel::< Arc< Vec< u8 > > >();
 				let properties = ClientProperties {
 					id: client_id,
@@ -612,8 +588,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					properties: properties.clone(),
 					stats: RwLock::new( stats )
 				};
-
-
+	
+				
 				if let Some( agent ) = &client.properties.uagent {
 					println!( "User {} started listening on {} with user-agent {}", client_id, client.source.read().await, agent );
 				} else {
@@ -622,37 +598,37 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				if meta_enabled {
 					println!( "User {} has icy metadata enabled", client_id );
 				}
-
+				
 				// Get the metaint
 				let metalen = serv.properties.metaint;
-
+				
 				// Keep track of how many bytes have been sent
 				let mut sent_count = 0;
-
+				
 				// Get a copy of the burst buffer and metadata
 				let burst_buf = source.burst_buffer.clone();
 				let metadata_copy = source.metadata_vec.clone();
-
+				
 				let arc_client = Arc::new( RwLock::new( client ) );
 				// Add the client id to the list of clients attached to the source
 				source.clients.insert( client_id, arc_client.clone() );
-
+				
 				{
 					let mut source_stats = source.stats.write().await;
 					source_stats.peak_listeners = std::cmp::max( source_stats.peak_listeners, source.clients.len() );
 				}
-
+				
 				// No more need for source
 				drop( source );
-
+				
 				// Add our client
 				serv.clients.insert( client_id, properties );
-
+				
 				// Set the max amount of listeners
 				serv.stats.peak_listeners = std::cmp::max( serv.stats.peak_listeners, serv.clients.len() );
-
+				
 				drop( serv );
-
+				
 				// Send the burst on connect buffer
 				let burst_success = {
 					if !burst_buf.is_empty() {
@@ -675,7 +651,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				};
 				drop( metadata_copy );
 				drop( burst_buf );
-
+				
 				if burst_success {
 					loop {
 						// Receive whatever bytes, then send to the client
@@ -693,13 +669,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 											let serv = server.read().await;
 											if let Some( source_lock ) = serv.sources.get( &*client.source.read().await ) {
 												let source = source_lock.read().await;
-
+												
 												source.metadata_vec.clone()
 											} else {
 												vec![ 0 ]
 											}
 										};
-
+										
 										write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
 									} else {
 										stream.write_all( &read.to_vec() ).await
@@ -718,12 +694,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						}
 					}
 				}
-
+				
 				// Close the message queue
 				arc_client.read().await.receiver.write().await.close();
-
+				
 				println!( "User {} has disconnected", client_id );
-
+				
 				let mut serv = server.write().await;
 				// Remove the client information from the list of clients
 				serv.clients.remove( &client_id );
@@ -740,10 +716,10 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// /admin/listmounts for listing all mounts available
 				// Anything else is not vanilla or unimplemented
 				// Return a 404 otherwise
-
+				
 				// Drop the write lock
 				drop( serv );
-
+				
 				// Paths
 				match path.as_str() {
 					"/admin/metadata" => {
@@ -753,15 +729,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						// Authentication passed
 						// Now check the query fields
 						// Takes in mode, mount, song and url
@@ -780,16 +756,16 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 												} ),
 											};
 											source.metadata_vec = get_metadata_vec( &source.metadata );
-											send_ok( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
+											send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
 										}
-										None => send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
+										None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/listclients" => {
@@ -799,48 +775,48 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ) ] => {
 									if let Some( source ) = serv.sources.get( mount ) {
 										let mut clients: HashMap< Uuid, Value > = HashMap::new();
-
+										
 										for client in source.read().await.clients.values() {
 											let client = client.read().await;
 											let properties = client.properties.clone();
-
+											
 											let value = json!( {
 												"user_agent": properties.uagent,
 												"metadata_enabled": properties.metadata,
 												"stats": &*client.stats.read().await
 											} );
-
+										
 											clients.insert( properties.id, value );
 										}
-
+										
 										if let Ok( serialized ) = serde_json::to_string( &clients ) {
-											send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
 										} else {
-											send_internal_error( &mut stream, &server_id, None ).await?;
+											send_internal_error( &mut stream, server_id, None ).await?;
 										}
 									} else {
-										send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/fallbacks" => {
@@ -850,36 +826,36 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount", "fallback" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ), fallback ] => {
 									if let Some( source ) = serv.sources.get( mount ) {
 										source.write().await.fallback = fallback.clone();
-
+										
 										if let Some( fallback ) = fallback {
 											println!( "Set the fallback for {} to {}", mount, fallback );
 										} else {
 											println!( "Unset the fallback for {}", mount );
 										}
-										send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
+										send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 									} else {
-										send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/moveclients" => {
@@ -889,15 +865,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount", "destination" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ), Some( dest ) ] => {
@@ -905,23 +881,23 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 										( Some( source ), Some( destination ) ) => {
 											let mut from = source.write().await;
 											let mut to = destination.write().await;
-
+											
 											for ( uuid, client ) in from.clients.drain() {
 												*client.read().await.source.write().await = to.mountpoint.clone();
 												to.clients.insert( uuid, client );
 											}
-
+											
 											println!( "Moved clients from {} to {}", mount, dest );
-											send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
+											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 										}
-										_ => send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
+										_ => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/killclient" => {
@@ -931,15 +907,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount", "id" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ), Some( uuid_str ) ] => {
@@ -948,20 +924,20 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 											if let Some( client ) = source.read().await.clients.get( &uuid ) {
 												drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
 												println!( "Killing client {}", uuid );
-												send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
+												send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 											} else {
-												send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid id" ) ) ).await?;
+												send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid id" ) ) ).await?;
 											}
 										}
-										( None, _ ) => send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
-										( Some( _ ), Err( _ ) ) => send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid id" ) ) ).await?,
+										( None, _ ) => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
+										( Some( _ ), Err( _ ) ) => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid id" ) ) ).await?,
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/killsource" => {
@@ -971,32 +947,32 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ) ] => {
 									if let Some( source ) = serv.sources.get( mount ) {
 										source.write().await.disconnect_flag = true;
-
+										
 										println!( "Killing source {}", mount );
-										send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
+										send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 									} else {
-										send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/admin/listmounts" => {
@@ -1006,17 +982,17 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 								return Ok( () )
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 							return Ok( () )
 						}
-
+						
 						let mut sources: HashMap< String, Value > = HashMap::new();
-
+						
 						for source in serv.sources.values() {
 							let source = source.read().await;
 
@@ -1032,14 +1008,14 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						}
 
 						if let Ok( serialized ) = serde_json::to_string( &sources ) {
-							send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+							send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
 						} else {
-							send_internal_error( &mut stream, &server_id, None ).await?;
+							send_internal_error( &mut stream, server_id, None ).await?;
 						}
 					}
 					"/api/serverinfo" => {
 						let serv = server.read().await;
-
+						
 						let info = json!( {
 							"mounts": serv.sources.keys().cloned().collect::< Vec< String > >(),
 							"properties": {
@@ -1055,11 +1031,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							},
 							"current_listeners": serv.clients.len()
 						} );
-
+						
 						if let Ok( serialized ) = serde_json::to_string( &info ) {
-							send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+							send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
 						} else {
-							send_internal_error( &mut stream, &server_id, None ).await?;
+							send_internal_error( &mut stream, server_id, None ).await?;
 						}
 					}
 					"/api/mountinfo" => {
@@ -1071,7 +1047,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 										let source = source.read().await;
 										let properties = &source.properties;
 										let stats = &source.stats.read().await;
-
+										
 										let info = json!( {
 											"metadata": source.metadata,
 											"properties": {
@@ -1088,21 +1064,21 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 											},
 											"current_listeners": source.clients.len()
 										} );
-
+										
 										if let Ok( serialized ) = serde_json::to_string( &info ) {
-											send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
 										} else {
-											send_internal_error( &mut stream, &server_id, None ).await?;
+											send_internal_error( &mut stream, server_id, None ).await?;
 										}
 									} else {
-										send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
 									}
 								}
-								_ => send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
-							send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/api/stats" => {
@@ -1117,7 +1093,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 								total_bytes_sent += clients.read().await.stats.read().await.bytes_sent;
 							}
 						}
-
+						
 						let epoch = {
 							if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 								time.as_secs()
@@ -1133,11 +1109,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							"session_bytes_sent": total_bytes_sent
 						} );
 
-						send_ok( &mut stream, &server_id, Some( ( "application/json; charset=utf-8", &response.to_string() ) ) ).await?;
+						send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &response.to_string() ) ) ).await?;
 
 					}
 					// Return 404
-					_ => send_not_found( &mut stream, &server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?,
+					_ => send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?,
 				}
 			}
 		}
@@ -1154,20 +1130,20 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 		}
 	}
-
+	
 	Ok( () )
 }
 
 async fn broadcast_to_clients( source: &Arc< RwLock< Source > >, data: Vec< u8 >, queue_size: usize, burst_size: usize ) {
 	// Remove these later
 	let mut dropped: Vec< Uuid > = Vec::new();
-
+	
 	let read = data.len();
 	let arc_slice = Arc::new( data );
-
+	
 	// Keep the write lock for the duration of the function, since a race condition with the burst on connect buffer is not wanted
 	let mut locked = source.write().await;
-
+	
 	// Broadcast to all listeners
 	for ( uuid, cli ) in &locked.clients {
 		let client = cli.read().await;
@@ -1179,7 +1155,7 @@ async fn broadcast_to_clients( source: &Arc< RwLock< Source > >, data: Vec< u8 >
 			( *buf_size ) += read;
 		}
 	}
-
+	
 	// Fill the burst on connect buffer
 	if burst_size > 0 {
 		let burst_buf = &mut locked.burst_buffer;
@@ -1189,7 +1165,7 @@ async fn broadcast_to_clients( source: &Arc< RwLock< Source > >, data: Vec< u8 >
 			burst_buf.drain( .. burst_buf.len() - burst_size );
 		}
 	}
-
+	
 	// Remove clients who have been kicked or disconnected
 	for uuid in dropped {
 		if let Some( client ) = locked.clients.remove( &uuid ) {
@@ -1213,7 +1189,7 @@ async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metale
 		}
 		while index < data.len() {
 			inserted.extend_from_slice( metadata );
-
+			
 			// Add the data
 			let end = std::cmp::min( data.len(), index + metalen );
 			if index != end {
@@ -1221,7 +1197,7 @@ async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metale
 				index = end;
 			}
 		}
-
+		
 		// Update the total sent amount and send
 		*sent_count = new_sent % metalen;
 		send = &inserted;
@@ -1230,11 +1206,11 @@ async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metale
 		*sent_count = new_sent;
 		send = data;
 	}
-
+	
 	stream.write_all( &send ).await
 }
 
-async fn send_listener_ok( stream: &mut TcpStream, id: &str, properties: &IcyProperties, meta_enabled: bool, metaint: usize ) -> Result< (), Box< dyn Error > > {
+async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, meta_enabled: bool, metaint: usize ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1259,11 +1235,11 @@ async fn send_listener_ok( stream: &mut TcpStream, id: &str, properties: &IcyPro
 	stream.write_all( ( format!( "icy-name:{}\r\n", properties.name.as_ref().unwrap_or( &"Unnamed Station".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-pub:{}\r\n", properties.public as usize ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-url:{}\r\n\r\n", properties.url.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
-
+	
 	Ok( () )
 }
 
-async fn send_not_found( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 404 File Not Found\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1279,11 +1255,11 @@ async fn send_not_found( stream: &mut TcpStream, id: &str, message: Option< ( &s
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-
+	
 	Ok( () )
 }
 
-async fn send_ok( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_ok( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1291,23 +1267,19 @@ async fn send_ok( stream: &mut TcpStream, id: &str, message: Option< ( &str, &st
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
-	server_info(stream).await?;
+	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-
+	
 	Ok( () )
 }
 
-async fn send_continue( stream: &mut TcpStream, id: &str ) -> Result< (), Box< dyn Error > > {
-	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
-	stream.write_all( b"Connection: Close\r\n" ).await?;
-	server_info(stream).await?;
-	Ok( () )
-}
-
-async fn send_internal_error( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_internal_error( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 500 Internal Server Error\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1315,15 +1287,19 @@ async fn send_internal_error( stream: &mut TcpStream, id: &str, message: Option<
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
-	server_info(stream).await?;
+	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-
+	
 	Ok( () )
 }
 
-async fn send_bad_request( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_bad_request( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 400 Bad Request\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1331,15 +1307,19 @@ async fn send_bad_request( stream: &mut TcpStream, id: &str, message: Option< ( 
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
-	server_info(stream).await?;
+	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
+	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-
+	
 	Ok( () )
 }
 
-async fn send_forbidden( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_forbidden( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 403 Forbidden\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1347,15 +1327,19 @@ async fn send_forbidden( stream: &mut TcpStream, id: &str, message: Option< ( &s
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
-	server_info(stream).await?;
+	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
+	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-
+	
 	Ok( () )
 }
 
-async fn send_unauthorized( stream: &mut TcpStream, id: &str, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 401 Authorization Required\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -1364,21 +1348,15 @@ async fn send_unauthorized( stream: &mut TcpStream, id: &str, message: Option< (
 		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( b"WWW-Authenticate: Basic realm=\"Icy Server\"\r\n" ).await?;
-	server_info(stream).await?;
-	if let Some( ( _, text ) ) = message {
-		stream.write_all( text.as_bytes() ).await?;
-	}
-
-	Ok( () )
-}
-
-async fn server_info(stream: &mut TcpStream)  -> Result< (), Box< dyn Error > > {
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-
+	if let Some( ( _, text ) ) = message {
+		stream.write_all( text.as_bytes() ).await?;
+	}
+	
 	Ok( () )
 }
 
@@ -1397,7 +1375,7 @@ fn get_metadata_vec( metadata: &Option< IcyMetadata > ) -> Vec< u8 > {
 			subvec.extend_from_slice( url.as_bytes() );
 		}
 		subvec.extend_from_slice( b"';" );
-
+		
 		// Calculate n
 		let len = subvec.len() - 1;
 		subvec[ 0 ] = {
@@ -1412,7 +1390,7 @@ fn get_metadata_vec( metadata: &Option< IcyMetadata > ) -> Vec< u8 > {
 			}
 		} as u8;
 	}
-
+	
 	subvec
 }
 
@@ -1424,15 +1402,15 @@ fn extract_queries( url: &str ) -> ( &str, Option< Vec< Query > > ) {
 			if let Some( ( name, value ) ) = field.replace( "+", " " ).split_once( '=' ) {
 				let name = urlencoding::decode( name );
 				let value = urlencoding::decode( value );
-
+				
 				if let Ok( field ) = name{
 					if let Ok( value ) = value {
 						queries.push( Query{ field, value } );
-					}
+					}					
 				}
 			}
 		}
-
+		
 		( path, Some( queries ) )
 	} else {
 		( url, None )
@@ -1443,7 +1421,7 @@ fn populate_properties( properties: &mut IcyProperties, headers: &[ httparse::He
 	for header in headers {
 		let name = header.name;
 		let val = std::str::from_utf8( header.value ).unwrap_or( "" );
-
+		
 		// There's a nice list here: https://github.com/ben221199/MediaCast
 		// Although, these were taken directly from Icecast's source: https://github.com/xiph/Icecast-Server/blob/master/src/source.c
 		match name {
@@ -1482,7 +1460,7 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 
 fn get_queries_for( keys: Vec< &str >, queries: &[ Query ] ) -> Vec< Option< String > > {
 	let mut results = vec![ None; keys.len() ];
-
+	
 	for query in queries {
 		let field = query.field.as_str();
 		for ( i, key ) in keys.iter().enumerate() {
@@ -1491,7 +1469,7 @@ fn get_queries_for( keys: Vec< &str >, queries: &[ Query ] ) -> Vec< Option< Str
 			}
 		}
 	}
-
+	
 	results
 }
 
@@ -1538,7 +1516,7 @@ fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
 		source_timeout: default_property_limits_source_timeout()
 	} );
 	map
-}
+}	
 
 #[ tokio::main ]
 async fn main() {
